@@ -1,138 +1,153 @@
-# flux_fracture — Disjoint Linear Algebra for Constraint Systems
+# flux-fracture-c
 
-Single-header C99 library that fractures constraint systems into independent blocks via BFS connected components on the bipartite constraint-dimension dependency graph.
+## Fracture propagation in constraint systems
 
-## How It Works
+Imagine a sheet of glass with a crack. When stress is applied, the crack propagates along paths determined by the stress field. The crack doesn't split the glass randomly — it follows the lines of least resistance, separating the sheet into independent pieces that can be analyzed separately.
 
-You have N constraints and M dimensions (variables). Each constraint depends on some subset of dimensions. The key insight: if two constraints share no dimensions, they can be checked independently. Fracture finds those independent groups automatically.
+This library does the same thing for constraint systems. A constraint system is a set of equations where each equation involves some subset of variables. If you build a graph where constraints and variables are nodes, and edges connect each constraint to the variables it involves, the connected components of this graph are independent sub-problems. You can solve each one separately and combine the results.
 
-**Step 1 — Build the graph.** Create a bipartite graph: constraints on one side, dimensions on the other. Draw an edge between constraint `i` and dimension `j` if constraint `i` depends on dimension `j`.
+This is *fracture*: splitting a large constraint system into independent blocks.
 
-**Step 2 — Find connected components.** Run BFS on this graph. Each connected component is a set of constraints that are transitively coupled (they share dimensions, possibly through other constraints). Different components are truly independent.
+## The bipartite graph
 
-**Step 3 — Solve in parallel.** Each component becomes an independent block. Solve them separately — in parallel, on different threads, even on different machines.
+A constraint system has two kinds of things: constraints (equations) and dimensions (variables). Constraint 0 might involve dimensions 1 and 3. Constraint 1 might involve dimensions 2 and 4. If constraint 0 and constraint 1 share no dimensions, they're independent — you can solve them in parallel.
 
-**Step 4 — Coalesce.** Merge the per-block error masks with bitwise OR. Because the blocks share no dimensions, this is provably identical to checking everything at once. Zero false negatives, guaranteed.
+The bipartite graph captures this:
+- Left nodes: constraints (C₀, C₁, C₂, ...)
+- Right nodes: dimensions (D₀, D₁, D₂, ...)
+- Edges: constraint Cᵢ involves dimension Dⱼ
+
+Connected components of this graph = independent blocks.
+
+## Walk through an example
+
+Consider 4 constraints on 4 dimensions:
+
+```
+C₀ involves D₀, D₁       (coupled pair)
+C₁ involves D₀, D₁       (same pair)
+C₂ involves D₂, D₃       (different pair)
+C₃ involves D₂, D₃       (same pair)
+```
+
+The bipartite graph:
+
+```
+C₀ ── D₀     C₂ ── D₂
+  ╲ ╱           ╲ ╱
+   ╳             ╳
+  ╱ ╲           ╱ ╲
+C₁ ── D₁     C₃ ── D₃
+```
+
+Two connected components: {C₀, C₁, D₀, D₁} and {C₂, C₃, D₂, D₃}.
+
+The fracture algorithm finds these components via BFS. You can solve the two blocks in parallel. The speedup potential is `n_constraints / largest_block = 4 / 2 = 2×`.
+
+## The algorithm (BFS connected components)
+
+1. Build adjacency matrix from the edge list
+2. For each unvisited constraint node, start a BFS
+3. BFS alternates between constraint and dimension nodes (bipartite traversal)
+4. Each BFS tree is one connected component = one independent block
+5. Sort indices within each block for deterministic output
+
+Time complexity: O(C × D) for the adjacency matrix, O(C + D) for BFS.
+
+## Coalescence
+
+After solving each block independently, you need to combine the results. Each block produces an error mask (which constraints are violated). Coalescence maps local bit positions back to global constraint indices and combines them via bitwise OR.
+
+```
+Block 0 mask: 0b01 (constraint 0 violated)
+Block 1 mask: 0b10 (constraint 2 violated)
+Combined:     0b0101 (constraints 0 and 2 violated)
+```
+
+**Theorem**: If fracture correctly identifies connected components, coalescence via bitwise OR has zero false negatives. Every violation in the monolithic solution appears in the coalesced result.
+
+## Use it
+
+Single-header C99 library. Define `FRACTURE_IMPLEMENTATION` in exactly one translation unit:
 
 ```c
 #define FRACTURE_IMPLEMENTATION
 #include "flux_fracture.h"
+```
 
-/* 8 constraints, each touching only its own dimension */
-frac_edge edges[8];
-for (int i = 0; i < 8; i++)
-    edges[i] = (frac_edge){i, i};
+Build a constraint system and fracture it:
 
-/* Fracture into independent blocks */
-frac_result result = frac_fracture_from_edges(edges, 8, 8, 8);
-/* result.n_blocks == 8, result.speedup_potential == 8.0 */
+```c
+// Define which constraints touch which dimensions
+frac_edge edges[] = {
+    {0, 0}, {0, 1},  // C₀ → D₀, D₁
+    {1, 0}, {1, 1},  // C₁ → D₀, D₁
+    {2, 2}, {2, 3},  // C₂ → D₂, D₃
+    {3, 2}, {3, 3},  // C₃ → D₂, D₃
+};
 
-/* Each block produces an error mask */
-uint64_t masks[8] = {1, 0, 1, 0, 1, 0, 1, 0};
+frac_result result = frac_fracture_from_edges(edges, 8, 4, 4);
 
-/* Coalesce: bitwise OR merges them perfectly */
-frac_coalesce_result cr = frac_coalesce(masks, result.blocks, 8, 8);
-/* cr.error_mask == 0x55 — constraints 0,2,4,6 violated */
+printf("Blocks: %d\n", result.n_blocks);          // 2
+printf("Speedup: %.1f×\n", result.speedup_potential); // 2.0×
 
-/* Verify it matches monolithic checking */
-bool ok = frac_coalesce_verify(cr.error_mask, 0x55, 8);
+// Solve each block independently, then coalesce
+uint64_t masks[] = {0b01, 0b10}; // per-block results
+frac_coalesce_result cr = frac_coalesce(masks, result.blocks, 2, 4);
+printf("Error mask: 0x%lx\n", cr.error_mask);     // 0x5
 
 frac_result_free(&result);
 ```
 
-### The Theorem
+## Adaptive re-fracture
 
-If fracture correctly identifies connected components of the constraint-dimension dependency graph, coalescence via bitwise OR preserves zero false negatives.
+Constraints change at runtime — new equations appear, old ones expire. `frac_adaptive_refracture` takes a previous fracture result and a set of new edges, rebuilds the graph, and re-fractures:
 
-**Proof:** Each constraint violation is a Boolean event. For independent blocks, the event spaces are disjoint (no shared dimensions). The union of all violations = OR of block error masks. QED.
+```c
+frac_edge new_edges[] = {{1, 2}};  // now C₁ also involves D₂
+frac_delta delta;
+frac_result new_result = frac_adaptive_refracture(
+    &result, new_edges, 1, 4, 4, &delta
+);
+printf("Structure changed: %s\n", delta.structure_changed ? "yes" : "no");
+```
 
-## What C Teaches Us
+## Test cases
 
-This library is a single header file. That's not laziness — it's a design choice that teaches you something about how constraint systems interact with their host environment:
+The test suite covers 4 dependency structures plus coalescence and adaptive re-fracture:
 
-- **Single-header pattern** — `flux_fracture.h` is both the declaration and the implementation. `#define FRACTURE_IMPLEMENTATION` before including to get the code; omit it to get just the types and function signatures. This means zero build system integration. Drop the file in, compile, done. For a constraint library that might end up embedded in firmware, game engines, or kernel modules, this matters.
-- **Preprocessor for zero-cost optional implementation** — The implementation is emitted exactly once, at the translation unit where you define `FRACTURE_IMPLEMENTATION`. Every other file sees only declarations. No linker tricks, no weak symbols, no RTTI.
-- **Manual memory management = you see every allocation** — `frac_result_free()` is explicit. There's no destructor hiding behind a scope exit, no garbage collector deciding when to collect. In a real-time constraint system, you need to know exactly when memory is allocated and freed. C makes that visible — `frac_fracture_from_edges()` allocates the block arrays, `frac_result_free()` frees them. That's the complete story.
-- **No hidden costs** — No vtable, no reference counting, no exception unwinding tables. The BFS is a flat loop over a flat array. What you see in the source is what runs on the metal.
+| Test | Structure | Blocks | Speedup |
+|------|-----------|--------|---------|
+| A | Fully independent (8 constraints, 8 dims) | 8 | 8× |
+| B | Block diagonal (2 blocks of 4) | 2 | 2× |
+| C | Chain (overlapping pairs) | 1 | limited |
+| D | Fully connected | 1 | 1× (no parallelism) |
 
-The constraint system architecture benefits from C's transparency: when checking 8 values against 8 bounds in a tight loop, you can reason exactly about cycles, cache lines, and allocation timing.
+Plus coalescence verification (zero false negatives) and adaptive re-fracture (structure change detection).
 
-## API
-
-### Data Structures
-
-| Type | Description |
-|------|-------------|
-| `frac_edge` | Bipartite graph edge: `{constraint_idx, dim_idx}` |
-| `frac_block` | Independent block: constraint/dimension index arrays |
-| `frac_result` | Fracture result: blocks, stats, speedup potential |
-| `frac_coalesce_result` | Coalesced error mask with verification |
-| `frac_adjacency` | Bipartite adjacency matrix |
-| `frac_delta` | Change between two fracture results |
-
-### Functions
-
-| Function | Description |
-|----------|-------------|
-| `frac_graph_build()` | Build adjacency from edge list |
-| `frac_graph_from_masks()` | Build adjacency from per-constraint dim masks |
-| `frac_fracture()` | BFS connected components → independent blocks |
-| `frac_fracture_from_edges()` | Convenience: edges → fracture in one call |
-| `frac_coalesce()` | Bitwise OR coalescence with index remapping |
-| `frac_coalesce_verify()` | Verify zero false negatives |
-| `frac_adaptive_refracture()` | Re-fracture with new edges, compute delta |
-| `frac_result_free()` | Free all memory |
-| `frac_adjacency_free()` | Free adjacency memory |
-
-## Building
+Build and run tests:
 
 ```bash
-make test    # Compile and run tests
-make bench   # Compile and run benchmark
-make clean   # Remove build artifacts
+make test
 ```
 
-Requires C99 compiler (gcc or clang). No external dependencies.
+## Why does this work?
 
-## Test Results
+Because connected components partition the graph into truly independent pieces. Two constraints in different components share no variables — they *cannot* affect each other's solution. Solving them together gives the same answer as solving them separately. The coalescence theorem (bitwise OR preserves all violations) guarantees you don't lose any information by splitting.
 
-The test suite validates:
+The BFS algorithm is optimal for this problem — you must visit every node at least once to determine which component it belongs to, and BFS does exactly that with O(C + D) work.
 
-- **Fully independent** (8 constraints → 8 blocks, 8x speedup)
-- **Block diagonal** (2 blocks of 4, 2x speedup)
-- **Chain** (cyclic overlapping pairs → 1 block, no speedup)
-- **Coalescence correctness** (1000 random trials, zero mismatches)
-- **Adaptive re-fracture** (progressive merging)
-- **Edge cases** (empty, single, orphan dimensions)
+## API reference
 
-## Architecture
-
-```
-constraint-dimension bipartite graph
-         │
-         ▼
-    BFS traversal (connected components)
-         │
-         ▼
-    independent blocks ──► parallel solve ──► per-block error masks
-         │                                           │
-         │              ┌────────────────────────────┘
-         ▼              ▼
-    frac_coalesce (bitwise OR with index remapping)
-         │
-         ▼
-    unified error mask = monolithic result (proven zero false negatives)
-```
-
-## Where to Go Next
-
-| Repo | Language | What You'll Learn |
-|------|----------|-------------------|
-| [flux-fracture](https://github.com/SuperInstance/flux-fracture) | Rust | Same algorithm with ownership model, zero-cost generics, and parallel iterators |
-| [flux-check-js](https://github.com/SuperInstance/flux-check-js) | TypeScript | Full engine with fracture + sediment + industry presets |
-| [flux-engine-c](https://github.com/SuperInstance/flux-engine-c) | C | Combined engine: check + fracture + sediment in one header |
-| [plato-types](https://github.com/SuperInstance/plato-types) | Python | Tile lifecycle and Lamport clocks for fleet coordination |
+| Function | What it does |
+|----------|-------------|
+| `frac_graph_build` | Build adjacency matrix from edge list |
+| `frac_fracture` | BFS connected components → independent blocks |
+| `frac_coalesce` | Combine per-block error masks via bitwise OR |
+| `frac_coalesce_verify` | Check coalesced mask matches monolithic |
+| `frac_adaptive_refracture` | Re-fracture after adding new edges |
+| `frac_result_free` | Free all allocated memory |
 
 ## License
 
-Part of the Constraint Theory Ecosystem — Forgemaster ⚒️
+MIT
